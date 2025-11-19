@@ -2,10 +2,12 @@ import argparse
 import importlib
 import importlib.resources
 import json
+import logging
 import os
 import pkgutil
 import sys
 import textwrap
+from types import MappingProxyType
 from typing import Any
 
 import sentry_sdk
@@ -28,6 +30,14 @@ if sentry_dsn := os.getenv("SENTRY_DSN"):
 
 for plugin_info in pkgutil.iter_modules(checks.__path__):
     importlib.import_module(f".{plugin_info.name}", package=checks.__name__)
+
+
+def setup_logging(debug: bool = False) -> None:
+    if debug:
+        logging.basicConfig(level=logging.CRITICAL + 1, format="%(levelname)s: %(message)s")
+        logging.getLogger("flatpak_builder_lint").setLevel(logging.DEBUG)
+    else:
+        logging.disable(logging.CRITICAL)
 
 
 def _filter(info: set[str], excepts: set[str]) -> list[str]:
@@ -100,7 +110,7 @@ def run_checks(
         case "manifest":
             check_method_name = "check_manifest"
             infer_appid_func = manifest.infer_appid
-            check_method_arg: str | dict[str, Any] = manifest.show_manifest(path)
+            check_method_arg: str | MappingProxyType[str, Any] = manifest.show_manifest(path)
         case "builddir":
             check_method_name = "check_build"
             infer_appid_func = builddir.infer_appid
@@ -274,8 +284,18 @@ def main() -> int:
         help="Enable reporting of stale exceptions to linter repository",
         action="store_true",
     )
+    parser.add_argument(
+        "--debug",
+        help="Enable debug logging",
+        action="store_true",
+    )
 
     args = parser.parse_args()
+    setup_logging(args.debug)
+
+    logger = logging.getLogger(__name__)
+    logger.debug("flatpak-builder-lint version: %s", __version__)
+
     exit_code = 0
 
     path = os.getcwd() if args.cwd else args.path[0]
