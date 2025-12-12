@@ -38,6 +38,19 @@ os.makedirs(config.CACHEDIR, exist_ok=True)
 session = CachedSession(CACHEFILE, backend="sqlite", expire_after=3600)
 
 
+def filter_request_headers(headers: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "accept",
+        "accept-encoding",
+        "connection",
+        "content-type",
+        "if-modified-since",
+        "if-none-match",
+        "user-agent",
+    }
+    return {k: v for k, v in headers.items() if k.lower() in allowed}
+
+
 def ignore_ref(ref: str) -> bool:
     parts = ref.split("/")
     return (
@@ -50,7 +63,16 @@ def ignore_ref(ref: str) -> bool:
 @cache
 def fetch_summary_bytes(url: str) -> bytes:
     try:
-        r = session.get(url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
+        r = session.get(
+            url,
+            allow_redirects=False,
+            timeout=REQUEST_TIMEOUT,
+            headers={"Accept-Encoding": None},
+        )
+        logger.debug(
+            "Request headers for %s: %s", url, filter_request_headers(dict(r.request.headers))
+        )
+        logger.debug("Response headers for %s: %s", url, dict(r.headers))
         if r.status_code == 200 and r.headers.get("Content-Type") == "application/octet-stream":
             return r.content
         logger.debug(
@@ -71,6 +93,7 @@ def fetch_summary_bytes(url: str) -> bytes:
         resource_path = files(staticfiles).joinpath(local_summary_file)
         if resource_path.is_file():
             with resource_path.open("rb") as f:
+                logger.debug("Using local summary file: %s", local_summary_file)
                 return f.read()
     except (OSError, FileNotFoundError) as e:
         logger.debug("Exception loading local summary file: %s: %s", type(e).__name__, e)
@@ -152,15 +175,6 @@ def get_eol_runtimes(url: str) -> set[str]:
         ):
             eols.add(f"{ref_id}//{branch}")
 
-    extra = (
-        "org.gnome.Platform//3.38",
-        "org.gnome.Sdk//3.38",
-        "org.kde.Sdk//5.14",
-        "org.kde.Platform//5.14",
-    )
-
-    eols.update(extra)
-
     return eols
 
 
@@ -181,9 +195,19 @@ def check_url(url: str, strict: bool = False) -> tuple[bool, str | None]:
     if not url.startswith(("https://", "http://")):
         raise Exception("Invalid input")
 
+    if strict:
+        logger.debug("Strict mode is enabled. Only accepting HTTP 200 for %s", url)
+    else:
+        logger.debug("Strict mode is disabled. Accepting HTTP 2xx-3xx for %s", url)
+
     resp_info = None
     try:
         with requests.get(url, allow_redirects=False, timeout=REQUEST_TIMEOUT, stream=True) as r:
+            logger.debug(
+                "Request headers for %s: %s", url, filter_request_headers(dict(r.request.headers))
+            )
+            logger.debug("Response headers for %s: %s", url, dict(r.headers))
+
             ok = r.status_code == 200 if strict else r.ok
             if ok:
                 return True, None
@@ -196,7 +220,6 @@ def check_url(url: str, strict: bool = False) -> tuple[bool, str | None]:
             resp_info = " | ".join(
                 [
                     f"Status: {r.status_code}",
-                    f"Headers: {dict(r.headers)}",
                     f"Body: {body}",
                 ]
             )
@@ -207,16 +230,49 @@ def check_url(url: str, strict: bool = False) -> tuple[bool, str | None]:
 
 
 @cache
-def get_remote_exceptions(appid: str) -> set[str]:
+def get_remote_exceptions_flathub(appid: str) -> set[str]:
+    url = f"{config.FLATHUB_API_URL}/exceptions/{appid}"
     try:
         # exception updates should be reflected immediately
         r = requests.get(
-            f"{config.FLATHUB_API_URL}/exceptions/{appid}",
-            allow_redirects=False,
-            timeout=REQUEST_TIMEOUT,
+            url, allow_redirects=False, timeout=REQUEST_TIMEOUT, headers={"Accept-Encoding": None}
         )
+        logger.debug(
+            "Request headers for %s: %s", url, filter_request_headers(dict(r.request.headers))
+        )
+        logger.debug("Response headers for %s: %s", url, dict(r.headers))
         if r.status_code == 200 and r.headers.get("Content-Type") == "application/json":
+            logger.debug("Loaded remote exceptions from %s: %s", url, set(r.json()))
             return set(r.json())
+    except requests.exceptions.RequestException as e:
+        logger.debug(
+            "Request exception when fetching exceptions for %s: %s: %s", appid, type(e).__name__, e
+        )
+
+    return set()
+
+
+@cache
+def get_remote_exceptions_github(appid: str) -> set[str]:
+    url = (
+        f"{config.GITHUB_CONTENT_CDN}/{config.LINTER_FULL_REPO}/"
+        f"HEAD/flatpak_builder_lint/staticfiles/exceptions.json"
+    )
+    try:
+        # exception updates should be reflected immediately
+        r = requests.get(url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
+        logger.debug(
+            "Request headers for %s: %s", url, filter_request_headers(dict(r.request.headers))
+        )
+        logger.debug("Response headers for %s: %s", url, dict(r.headers))
+        if r.status_code == 200 and r.headers.get("Content-Type", "").startswith("text/plain"):
+            logger.debug(
+                "Loaded remote exceptions for %s from %s: %s",
+                appid,
+                url,
+                set(r.json().get(appid, {}).keys()),
+            )
+            return set(r.json().get(appid, {}).keys())
     except requests.exceptions.RequestException as e:
         logger.debug(
             "Request exception when fetching exceptions for %s: %s: %s", appid, type(e).__name__, e
@@ -342,6 +398,7 @@ def get_domain(appid: str) -> str | None:
         fqdn = ".".join(reversed(appid.split("."))).lower()
         psl = PublicSuffixList()
         if psl.is_private(fqdn):
+            logger.debug("Using PSL to determine domain for appid: %s", appid)
             domain = demangle(psl.privatesuffix(fqdn))
         else:
             domain = ".".join(reversed([demangle(i) for i in appid.split(".")[:-1]])).lower()

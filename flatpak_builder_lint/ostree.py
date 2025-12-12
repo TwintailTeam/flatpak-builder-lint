@@ -1,5 +1,7 @@
 import json
+import logging
 import os
+from functools import cache
 
 import gi
 
@@ -7,6 +9,8 @@ from . import config
 
 gi.require_version("OSTree", "1.0")
 from gi.repository import Gio, GLib, OSTree  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 def open_ostree_repo(repo_path: str) -> OSTree.Repo:
@@ -23,13 +27,16 @@ def open_ostree_repo(repo_path: str) -> OSTree.Repo:
     return repo
 
 
+@cache
 def get_refs(repo_path: str, ref_prefix: str | None) -> set[str]:
     repo = open_ostree_repo(repo_path)
     _, refs = repo.list_refs(ref_prefix, None)
 
+    logger.debug("Found refs %s in repo %s", set(refs.keys()), os.path.abspath(repo_path))
     return set(refs.keys())
 
 
+@cache
 def get_all_refs_filtered(repo_path: str) -> set[str]:
     refs = get_refs(repo_path, None)
 
@@ -43,8 +50,9 @@ def get_all_refs_filtered(repo_path: str) -> set[str]:
     }
 
 
+@cache
 def get_primary_refs(repo_path: str) -> set[str]:
-    return {
+    primary_refs = {
         r
         for r in get_refs(repo_path, None)
         if (parts := r.split("/"))
@@ -52,8 +60,11 @@ def get_primary_refs(repo_path: str) -> set[str]:
         and parts[0] == "app"
         and parts[2] in config.FLATHUB_SUPPORTED_ARCHES
     }
+    logger.debug("Found primary refs %s in repo %s", primary_refs, os.path.abspath(repo_path))
+    return primary_refs
 
 
+@cache
 def infer_appid(path: str) -> str | None:
     refs = get_primary_refs(path)
     if refs:
@@ -87,6 +98,13 @@ def extract_subpath(
     if rev:
         if should_pass:
             try:
+                logger.debug(
+                    "Checking out subpath %s with G_IO_ERROR_NOT_FOUND allowed "
+                    "for ref %s at dest %s",
+                    subpath,
+                    ref,
+                    dest,
+                )
                 repo.checkout_at(opts, AT_FDCWD, dest, rev, None)
             except GLib.Error as err:
                 if err.matches(Gio.io_error_quark(), Gio.IOErrorEnum.NOT_FOUND):
@@ -94,6 +112,7 @@ def extract_subpath(
                 else:
                     raise
         else:
+            logger.debug("Checking out subpath %s for ref %s at dest %s", subpath, ref, dest)
             repo.checkout_at(opts, AT_FDCWD, dest, rev, None)
 
 
